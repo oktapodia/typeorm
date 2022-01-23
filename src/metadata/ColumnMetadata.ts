@@ -111,6 +111,11 @@ export class ColumnMetadata {
     generationStrategy?: "uuid"|"increment"|"rowid";
 
     /**
+     * Identity column type. Supports only in Postgres 10+.
+     */
+    generatedIdentity?: "ALWAYS"|"BY DEFAULT";
+
+    /**
      * Column comment.
      * This feature is not supported by all databases.
      */
@@ -360,6 +365,8 @@ export class ColumnMetadata {
             this.default = options.args.options.default;
         if (options.args.options.onUpdate)
             this.onUpdate = options.args.options.onUpdate;
+        if (options.args.options.generatedIdentity)
+            this.generatedIdentity = options.args.options.generatedIdentity;
         if (options.args.options.scale !== null && options.args.options.scale !== undefined)
             this.scale = options.args.options.scale;
         if (options.args.options.zerofill) {
@@ -615,7 +622,7 @@ export class ColumnMetadata {
                     if (relatedEntity && relatedEntity instanceof Object && !(relatedEntity instanceof FindOperator) && !(relatedEntity instanceof Buffer)) {
                         value = this.referencedColumn.getEntityValue(relatedEntity);
 
-                    } else if (embeddedObject[this.propertyName] && embeddedObject[this.propertyName] instanceof Object && !(embeddedObject[this.propertyName] instanceof FindOperator) && !(embeddedObject[this.propertyName] instanceof Buffer)) {
+                    } else if (embeddedObject[this.propertyName] && embeddedObject[this.propertyName] instanceof Object && !(embeddedObject[this.propertyName] instanceof FindOperator) && !(embeddedObject[this.propertyName] instanceof Buffer) && !(embeddedObject[this.propertyName] instanceof Date)) {
                         value = this.referencedColumn.getEntityValue(embeddedObject[this.propertyName]);
 
                     } else {
@@ -639,7 +646,7 @@ export class ColumnMetadata {
                 if (relatedEntity && relatedEntity instanceof Object && !(relatedEntity instanceof FindOperator) && !(relatedEntity instanceof Function) && !(relatedEntity instanceof Buffer)) {
                     value = this.referencedColumn.getEntityValue(relatedEntity);
 
-                } else if (entity[this.propertyName] && entity[this.propertyName] instanceof Object && !(entity[this.propertyName] instanceof FindOperator) && !(entity[this.propertyName] instanceof Function) && !(entity[this.propertyName] instanceof Buffer)) {
+                } else if (entity[this.propertyName] && entity[this.propertyName] instanceof Object && !(entity[this.propertyName] instanceof FindOperator) && !(entity[this.propertyName] instanceof Function) && !(entity[this.propertyName] instanceof Buffer) && !(entity[this.propertyName] instanceof Date)) {
                     value = this.referencedColumn.getEntityValue(entity[this.propertyName]);
 
                 } else {

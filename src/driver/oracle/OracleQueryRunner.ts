@@ -21,9 +21,9 @@ import {ColumnType} from "../types/ColumnTypes";
 import {IsolationLevel} from "../types/IsolationLevel";
 import {TableExclusion} from "../../schema-builder/table/TableExclusion";
 import {ReplicationMode} from "../types/ReplicationMode";
-import {BroadcasterResult} from "../../subscriber/BroadcasterResult";
 import { TypeORMError } from "../../error";
 import { QueryResult } from "../../query-runner/QueryResult";
+import {MetadataTableType} from "../types/MetadataTableType";
 
 /**
  * Runs queries on a single oracle database connection.
@@ -120,16 +120,12 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
             throw new TypeORMError(`Oracle only supports SERIALIZABLE and READ COMMITTED isolation`);
         }
 
-        const beforeBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastBeforeTransactionStartEvent(beforeBroadcastResult);
-        if (beforeBroadcastResult.promises.length > 0) await Promise.all(beforeBroadcastResult.promises);
+        await this.broadcaster.broadcast('BeforeTransactionStart');
 
         await this.query("SET TRANSACTION ISOLATION LEVEL " + isolationLevel);
         this.isTransactionActive = true;
 
-        const afterBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastAfterTransactionStartEvent(afterBroadcastResult);
-        if (afterBroadcastResult.promises.length > 0) await Promise.all(afterBroadcastResult.promises);
+        await this.broadcaster.broadcast('AfterTransactionStart');
     }
 
     /**
@@ -140,16 +136,12 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
         if (!this.isTransactionActive)
             throw new TransactionNotStartedError();
 
-        const beforeBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastBeforeTransactionCommitEvent(beforeBroadcastResult);
-        if (beforeBroadcastResult.promises.length > 0) await Promise.all(beforeBroadcastResult.promises);
+        await this.broadcaster.broadcast('BeforeTransactionCommit');
 
         await this.query("COMMIT");
         this.isTransactionActive = false;
 
-        const afterBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastAfterTransactionCommitEvent(afterBroadcastResult);
-        if (afterBroadcastResult.promises.length > 0) await Promise.all(afterBroadcastResult.promises);
+        await this.broadcaster.broadcast('AfterTransactionCommit');
     }
 
     /**
@@ -160,16 +152,12 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
         if (!this.isTransactionActive)
             throw new TransactionNotStartedError();
 
-        const beforeBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastBeforeTransactionRollbackEvent(beforeBroadcastResult);
-        if (beforeBroadcastResult.promises.length > 0) await Promise.all(beforeBroadcastResult.promises);
+        await this.broadcaster.broadcast('BeforeTransactionRollback');
 
         await this.query("ROLLBACK");
         this.isTransactionActive = false;
 
-        const afterBroadcastResult = new BroadcasterResult();
-        this.broadcaster.broadcastAfterTransactionRollbackEvent(afterBroadcastResult);
-        if (afterBroadcastResult.promises.length > 0) await Promise.all(afterBroadcastResult.promises);
+        await this.broadcaster.broadcast('AfterTransactionRollback');
     }
 
     /**
@@ -201,7 +189,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
 
             const result = new QueryResult();
 
-            result.raw = raw.rows || raw.outBinds || raw.rowsAffected;
+            result.raw = raw.rows || raw.outBinds || raw.rowsAffected || raw.implicitResults;
 
             if (raw?.hasOwnProperty('rows') && Array.isArray(raw.rows)) {
                 result.records = raw.rows;
@@ -209,6 +197,10 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
 
             if (raw?.hasOwnProperty('outBinds') && Array.isArray(raw.outBinds)) {
                 result.records = raw.outBinds;
+            }
+
+            if (raw?.hasOwnProperty('implicitResults') && Array.isArray(raw.implicitResults)) {
+                result.records = raw.implicitResults;
             }
 
             if (raw?.hasOwnProperty('rowsAffected')) {
@@ -229,8 +221,35 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
     /**
      * Returns raw data stream.
      */
-    stream(query: string, parameters?: any[], onEnd?: Function, onError?: Function): Promise<ReadStream> {
-        throw new TypeORMError(`Stream is not supported by Oracle driver.`);
+    async stream(query: string, parameters?: any[], onEnd?: Function, onError?: Function): Promise<ReadStream> {
+        if (this.isReleased) {
+            throw new QueryRunnerAlreadyReleasedError();
+        }
+
+        const executionOptions = {
+            autoCommit: !this.isTransactionActive,
+            outFormat: this.driver.oracle.OBJECT,
+        }
+
+        const databaseConnection = await this.connect();
+
+        this.driver.connection.logger.logQuery(query, parameters, this);
+
+        try {
+            const stream = databaseConnection.queryStream(query, parameters, executionOptions);
+            if (onEnd) {
+                stream.on("end", onEnd);
+            }
+
+            if (onError) {
+                stream.on("error", onError);
+            }
+
+            return stream;
+        } catch (err) {
+            this.driver.connection.logger.logQueryError(err, query, parameters, this);
+            throw new QueryFailedError(query, parameters, err);
+        }
     }
 
     /**
@@ -1155,7 +1174,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
         const table = tableOrName instanceof Table ? tableOrName : await this.getCachedTable(tableOrName);
         const index = indexOrName instanceof TableIndex ? indexOrName : table.indices.find(i => i.name === indexOrName);
         if (!index)
-            throw new TypeORMError(`Supplied index was not found in table ${table.name}`);
+            throw new TypeORMError(`Supplied index ${indexOrName} was not found in table ${table.name}`);
 
         const up = this.dropIndexSql(index);
         const down = this.createIndexSql(table, index);
@@ -1230,7 +1249,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
         const viewNamesString = viewNames.map(name => "'" + name + "'").join(", ");
         let query = `SELECT "T".* FROM ${this.escapePath(this.getTypeormMetadataTableName())} "T" ` +
             `INNER JOIN "USER_OBJECTS" "O" ON "O"."OBJECT_NAME" = "T"."name" AND "O"."OBJECT_TYPE" IN ( 'MATERIALIZED VIEW', 'VIEW' ) ` +
-            `WHERE "T"."type" IN ( 'MATERIALIZED_VIEW', 'VIEW' )`;
+            `WHERE "T"."type" IN ( '${MetadataTableType.MATERIALIZED_VIEW}', '${MetadataTableType.VIEW}' )`;
         if (viewNamesString.length > 0)
             query += ` AND "T"."name" IN (${viewNamesString})`;
         const dbViews = await this.query(query);
@@ -1242,7 +1261,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
             view.schema = parsedName.schema || dbView["schema"] || currentSchema;
             view.name = parsedName.tableName;
             view.expression = dbView["value"];
-            view.materialized = dbView["type"] === "MATERIALIZED_VIEW";
+            view.materialized = dbView["type"] === MetadataTableType.MATERIALIZED_VIEW;
             return view;
         });
     }
@@ -1348,18 +1367,16 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
                         )
                     );
 
-                    const uniqueConstraint = columnConstraints.find(constraint => constraint["CONSTRAINT_TYPE"] === "U");
-                    const isConstraintComposite = uniqueConstraint
-                        ? !!dbConstraints.find(dbConstraint => (
-                                dbConstraint["OWNER"] === dbColumn["OWNER"] &&
-                                dbConstraint["TABLE_NAME"] === dbColumn["TABLE_NAME"] &&
-                                dbConstraint["COLUMN_NAME"] !== dbColumn["COLUMN_NAME"] &&
-                                dbConstraint["CONSTRAINT_NAME"] === uniqueConstraint["CONSTRAINT_NAME"] &&
-                                dbConstraint["CONSTRAINT_TYPE"] === "U"
-                            )
+                    const uniqueConstraints = columnConstraints.filter(constraint => constraint["CONSTRAINT_TYPE"] === "U");
+                    const isConstraintComposite = uniqueConstraints.every((uniqueConstraint) => {
+                        return dbConstraints.some(dbConstraint => (
+                            dbConstraint["OWNER"] === dbColumn["OWNER"] &&
+                            dbConstraint["TABLE_NAME"] === dbColumn["TABLE_NAME"] &&
+                            dbConstraint["COLUMN_NAME"] !== dbColumn["COLUMN_NAME"] &&
+                            dbConstraint["CONSTRAINT_NAME"] === uniqueConstraint["CONSTRAINT_NAME"] &&
+                            dbConstraint["CONSTRAINT_TYPE"] === "U")
                         )
-                        : false;
-                    const isUnique = !!uniqueConstraint && !isConstraintComposite;
+                    })
 
                     const isPrimary = !!columnConstraints.find(constraint =>  constraint["CONSTRAINT_TYPE"] === "P");
 
@@ -1392,7 +1409,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
                         && dbColumn["DATA_DEFAULT"].trim() !== "NULL" ? tableColumn.default = dbColumn["DATA_DEFAULT"].trim() : undefined;
 
                     tableColumn.isNullable = dbColumn["NULLABLE"] === "Y";
-                    tableColumn.isUnique = isUnique;
+                    tableColumn.isUnique = uniqueConstraints.length > 0 && !isConstraintComposite;
                     tableColumn.isPrimary = isPrimary;
                     tableColumn.isGenerated = dbColumn["IDENTITY_COLUMN"] === "YES";
                     if (tableColumn.isGenerated) {
@@ -1566,14 +1583,8 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
 
     protected insertViewDefinitionSql(view: View): Query {
         const expression = typeof view.expression === "string" ? view.expression.trim() : view.expression(this.connection).getQuery();
-        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW"
-        const [query, parameters] = this.connection.createQueryBuilder()
-            .insert()
-            .into(this.getTypeormMetadataTableName())
-            .values({ type: type, name: view.name, value: expression })
-            .getQueryAndParameters();
-
-        return new Query(query, parameters);
+        const type = view.materialized ? MetadataTableType.MATERIALIZED_VIEW : MetadataTableType.VIEW;
+        return this.insertTypeormMetadataSql({ type: type, name: view.name, value: expression });
     }
 
     /**
@@ -1588,15 +1599,8 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
      * Builds remove view sql.
      */
     protected deleteViewDefinitionSql(view: View): Query {
-        const qb = this.connection.createQueryBuilder();
-        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW"
-        const [query, parameters] = qb.delete()
-            .from(this.getTypeormMetadataTableName())
-            .where(`${qb.escape("type")} = :type`, { type })
-            .andWhere(`${qb.escape("name")} = :name`, { name: view.name })
-            .getQueryAndParameters();
-
-        return new Query(query, parameters);
+        const type = view.materialized ? MetadataTableType.MATERIALIZED_VIEW : MetadataTableType.VIEW;
+        return this.deleteTypeormMetadataSql({ type, name: view.name });
     }
 
     /**
@@ -1713,7 +1717,7 @@ export class OracleQueryRunner extends BaseQueryRunner implements QueryRunner {
         // Ignore database when escaping paths
         const { schema, tableName } = this.driver.parseTableName(target);
 
-        if (schema) {
+        if (schema && schema !== this.driver.schema) {
             return `"${schema}"."${tableName}"`;
         }
 

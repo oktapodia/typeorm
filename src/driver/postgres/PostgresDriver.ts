@@ -16,6 +16,7 @@ import {ColumnType} from "../types/ColumnTypes";
 import {DataTypeDefaults} from "../types/DataTypeDefaults";
 import {MappedColumnTypes} from "../types/MappedColumnTypes";
 import {ReplicationMode} from "../types/ReplicationMode";
+import {VersionUtils} from "../../util/VersionUtils";
 import {PostgresConnectionCredentialsOptions} from "./PostgresConnectionCredentialsOptions";
 import {PostgresConnectionOptions} from "./PostgresConnectionOptions";
 import {PostgresQueryRunner} from "./PostgresQueryRunner";
@@ -70,9 +71,24 @@ export class PostgresDriver implements Driver {
     options: PostgresConnectionOptions;
 
     /**
-     * Master database used to perform all write queries.
+     * Database name used to perform all write queries.
      */
     database?: string;
+
+    /**
+     * Schema name used to perform all write queries.
+     */
+    schema?: string;
+
+    /**
+     * Schema that's used internally by Postgres for object resolution.
+     *
+     * Because we never set this we have to track it in separately from the `schema` so
+     * we know when we have to specify the full schema or not.
+     *
+     * In most cases this will be `public`.
+     */
+    searchSchema?: string;
 
     /**
      * Indicates if replication is enabled.
@@ -157,6 +173,11 @@ export class PostgresDriver implements Driver {
         "cube",
         "ltree"
     ];
+
+    /**
+     * Returns type of upsert supported by driver if any
+     */
+    readonly supportedUpsertType = "on-conflict-do-update";
 
     /**
      * Gets list of spatial column data types.
@@ -250,6 +271,8 @@ export class PostgresDriver implements Driver {
      */
     maxAliasLength = 63;
 
+    isGeneratedColumnsSupported: boolean = false;
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -263,12 +286,13 @@ export class PostgresDriver implements Driver {
         this.options = connection.options as PostgresConnectionOptions;
         this.isReplicated = this.options.replication ? true : false;
         if(this.options.useUTC) {
-            process.env.PGTZ = 'UTC';
+            process.env.PGTZ = "UTC";
         }
         // load postgres package
         this.loadDependencies();
 
         this.database = DriverUtils.buildDriverOptions(this.options.replication ? this.options.replication.master : this.options).database;
+        this.schema = DriverUtils.buildDriverOptions(this.options).schema;
 
         // ObjectUtils.assign(this.options, DriverUtils.buildDriverOptions(connection.options)); // todo: do it better way
         // validate options to make sure everything is set
@@ -297,11 +321,26 @@ export class PostgresDriver implements Driver {
                 return this.createPool(this.options, slave);
             }));
             this.master = await this.createPool(this.options, this.options.replication.master);
-            this.database = this.options.replication.master.database;
-
         } else {
             this.master = await this.createPool(this.options, this.options);
-            this.database = this.options.database;
+        }
+
+        if (!this.database || !this.searchSchema) {
+            const queryRunner = await this.createQueryRunner("master");
+
+            if (!this.database) {
+                this.database = await queryRunner.getCurrentDatabase();
+            }
+
+            if (!this.searchSchema) {
+                this.searchSchema = await queryRunner.getCurrentSchema();
+            }
+
+            await queryRunner.release();
+        }
+
+        if (!this.schema) {
+            this.schema = this.searchSchema;
         }
     }
 
@@ -310,20 +349,22 @@ export class PostgresDriver implements Driver {
      */
     async afterConnect(): Promise<void> {
         const extensionsMetadata = await this.checkMetadataForExtensions();
+        const [ connection, release ] = await this.obtainMasterConnection()
 
         const installExtensions = this.options.installExtensions === undefined || this.options.installExtensions;
         if (installExtensions && extensionsMetadata.hasExtensions) {
-                       return new Promise<void>((ok, fail) => {
-                this.master.connect(async (err: any, connection: any, release: Function) => {
-                    await this.enableExtensions(extensionsMetadata, connection);
-                    if (err) return fail(err);
-                    release();
-                    ok();
-                });
-            });
+            await this.enableExtensions(extensionsMetadata, connection);
         }
 
-        return Promise.resolve();
+        const results = await this.executeQuery(connection, "SHOW server_version;") as {
+            rows: {
+                server_version: string;
+            }[];
+        };
+        const versionString = results.rows[0].server_version;
+        this.isGeneratedColumnsSupported = VersionUtils.isGreaterOrEqual(versionString, "12.0");
+
+        await release()
     }
 
     protected async enableExtensions(extensionsMetadata: any, connection: any) {
@@ -599,9 +640,9 @@ export class PostgresDriver implements Driver {
                     // replace double quotes from the beginning and from the end
                     if (val.startsWith(`"`) && val.endsWith(`"`)) val = val.slice(1, -1);
                     // replace double escaped backslash to single escaped e.g. \\\\ -> \\
-                    val = val.replace(/(\\\\)/g, "\\")
+                    val = val.replace(/(\\\\)/g, "\\");
                     // replace escaped double quotes to non-escaped e.g. \"asd\" -> "asd"
-                    return val.replace(/(\\")/g, '"')
+                    return val.replace(/(\\")/g, '"');
                 });
 
                 // convert to number if that exists in possible enum options
@@ -671,7 +712,7 @@ export class PostgresDriver implements Driver {
             tablePath.unshift(schema);
         }
 
-        return tablePath.join('.');
+        return tablePath.join(".");
     }
 
     /**
@@ -679,9 +720,7 @@ export class PostgresDriver implements Driver {
      */
     parseTableName(target: EntityMetadata | Table | View | TableForeignKey | string): { database?: string, schema?: string, tableName: string } {
         const driverDatabase = this.database;
-
-        // This really should be abstracted into the driver as well..
-        const driverSchema = this.options.schema;
+        const driverSchema = this.schema;
 
         if (target instanceof Table || target instanceof View) {
             const parsed = this.parseTableName(target.name);
@@ -710,11 +749,11 @@ export class PostgresDriver implements Driver {
                 database: target.database || driverDatabase,
                 schema: target.schema || driverSchema,
                 tableName: target.tableName
-            }
+            };
 
         }
 
-        const parts = target.split(".")
+        const parts = target.split(".");
 
         return {
             database: driverDatabase,
@@ -814,7 +853,7 @@ export class PostgresDriver implements Driver {
         if (typeof defaultValue === "function") {
             const value = defaultValue();
 
-            return this.normalizeDatetimeFunction(value)
+            return this.normalizeDatetimeFunction(value);
         }
 
         if (typeof defaultValue === "object") {
@@ -908,13 +947,12 @@ export class PostgresDriver implements Driver {
      * Used for replication.
      * If replication is not setup then returns default connection's database connection.
      */
-    obtainMasterConnection(): Promise<any> {
-        return new Promise((ok, fail) => {
-            if (!this.master) {
-                fail(new TypeORMError("Driver not Connected"))
-                return;
-            }
+    async obtainMasterConnection(): Promise<[any, Function]> {
+        if (!this.master) {
+            throw new TypeORMError("Driver not Connected");
+        }
 
+        return new Promise((ok, fail) => {
             this.master.connect((err: any, connection: any, release: any) => {
                 err ? fail(err) : ok([connection, release]);
             });
@@ -926,13 +964,14 @@ export class PostgresDriver implements Driver {
      * Used for replication.
      * If replication is not setup then returns master (default) connection's database connection.
      */
-    async obtainSlaveConnection(): Promise<any> {
+    async obtainSlaveConnection(): Promise<[any, Function]> {
         if (!this.slaves.length) {
             return this.obtainMasterConnection();
         }
 
+        const random = Math.floor(Math.random() * this.slaves.length);
+
         return new Promise((ok, fail) => {
-            const random = Math.floor(Math.random() * this.slaves.length);
             this.slaves[random].connect((err: any, connection: any, release: any) => {
                 err ? fail(err) : ok([connection, release]);
             });
@@ -983,7 +1022,9 @@ export class PostgresDriver implements Driver {
                 || (tableColumn.enum && columnMetadata.enum && !OrmUtils.isArraysEqual(tableColumn.enum, columnMetadata.enum.map(val => val + ""))) // enums in postgres are always strings
                 || tableColumn.isGenerated !== columnMetadata.isGenerated
                 || (tableColumn.spatialFeatureType || "").toLowerCase() !== (columnMetadata.spatialFeatureType || "").toLowerCase()
-                || tableColumn.srid !== columnMetadata.srid;
+                || tableColumn.srid !== columnMetadata.srid
+                || tableColumn.generatedType !== columnMetadata.generatedType
+                || (tableColumn.asExpression || "").trim() !== (columnMetadata.asExpression || "").trim();
 
             // DEBUG SECTION
             // if (isColumnChanged) {
@@ -1007,7 +1048,7 @@ export class PostgresDriver implements Driver {
             //     console.log("==========================================");
             // }
 
-            return isColumnChanged
+            return isColumnChanged;
         });
     }
 
@@ -1078,9 +1119,10 @@ export class PostgresDriver implements Driver {
      */
     protected loadDependencies(): void {
         try {
-            this.postgres = PlatformTools.load("pg");
+            const postgres = this.options.driver || PlatformTools.load("pg");
+            this.postgres = postgres;
             try {
-                const pgNative = PlatformTools.load("pg-native");
+                const pgNative = this.options.nativeDriver || PlatformTools.load("pg-native");
                 if (pgNative && this.postgres.native) this.postgres = this.postgres.native;
 
             } catch (e) { }
@@ -1158,12 +1200,10 @@ export class PostgresDriver implements Driver {
      * Executes given query.
      */
     protected executeQuery(connection: any, query: string) {
+        this.connection.logger.logQuery(query);
+
         return new Promise((ok, fail) => {
-            this.connection.logger.logQuery(query);
-            connection.query(query, (err: any, result: any) => {
-                if (err) return fail(err);
-                ok(result);
-            });
+            connection.query(query, (err: any, result: any) => err ? fail(err) : ok(result));
         });
     }
 
@@ -1173,7 +1213,7 @@ export class PostgresDriver implements Driver {
      */
     protected normalizeDatetimeFunction(value: string) {
         // check if input is datetime function
-        const upperCaseValue = value.toUpperCase()
+        const upperCaseValue = value.toUpperCase();
         const isDatetimeFunction = upperCaseValue.indexOf("CURRENT_TIMESTAMP") !== -1
             || upperCaseValue.indexOf("CURRENT_DATE") !== -1
             || upperCaseValue.indexOf("CURRENT_TIME") !== -1
@@ -1182,26 +1222,26 @@ export class PostgresDriver implements Driver {
 
         if (isDatetimeFunction) {
             // extract precision, e.g. "(3)"
-            const precision = value.match(/\(\d+\)/)
+            const precision = value.match(/\(\d+\)/);
 
             if (upperCaseValue.indexOf("CURRENT_TIMESTAMP") !== -1) {
                 return precision ? `('now'::text)::timestamp${precision[0]} with time zone` : "now()";
 
             } else if (upperCaseValue === "CURRENT_DATE") {
-                return "('now'::text)::date"
+                return "('now'::text)::date";
 
             } else if (upperCaseValue.indexOf("CURRENT_TIME") !== -1) {
-                return precision ? `('now'::text)::time${precision[0]} with time zone` : "('now'::text)::time with time zone"
+                return precision ? `('now'::text)::time${precision[0]} with time zone` : "('now'::text)::time with time zone";
 
             } else if (upperCaseValue.indexOf("LOCALTIMESTAMP") !== -1) {
-                return precision ? `('now'::text)::timestamp${precision[0]} without time zone` : "('now'::text)::timestamp without time zone"
+                return precision ? `('now'::text)::timestamp${precision[0]} without time zone` : "('now'::text)::timestamp without time zone";
 
             } else if (upperCaseValue.indexOf("LOCALTIME") !== -1) {
-                return precision ? `('now'::text)::time${precision[0]} without time zone` : "('now'::text)::time without time zone"
+                return precision ? `('now'::text)::time${precision[0]} without time zone` : "('now'::text)::time without time zone";
             }
         }
 
-        return value
+        return value;
     }
 
     /**
