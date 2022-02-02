@@ -79,21 +79,21 @@ jobs:
   lint:
     working_directory: ~/typeorm
     docker:
-      - image: circleci/node:12
+      - image: circleci/node:14
     steps:
       - checkout
       - install-packages:
-          cache-key: node12
+          cache-key: node14
       - run: npm run lint
 
   build:
     working_directory: ~/typeorm
     docker:
-      - image: circleci/node:12
+      - image: circleci/node:14
     steps:
       - checkout
       - install-packages:
-          cache-key: node12
+          cache-key: node14
       - run: npm run compile
       - persist_to_workspace:
           root: ~/typeorm
@@ -196,27 +196,27 @@ workflows:
           matrix:
             parameters:
               node-version:
-                - "12"
                 - "13"
                 - "14"
+                - "16"
       - test:
-          name: test (cockroachdb) - Node v12
+          name: test (cockroachdb) - Node v14
           requires:
             - lint
             - build
           databases: "cockroachdb"
-          node-version: "12"
+          node-version: "14"
       - test:
-          name: test (oracle) - Node v12
+          name: test (oracle) - Node v14
           requires:
             - lint
             - build
           databases: "oracle"
-          node-version: "12"
+          node-version: "14"
       - test:
-          name: test (postgres 12) - Node v12
+          name: test (postgres 12) - Node v14
           requires:
             - lint
             - build
           databases: "postgres-12"
-          node-version: "12"
+          node-version: "14"
